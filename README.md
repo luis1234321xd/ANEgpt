@@ -44,7 +44,9 @@ Each transformer layer uses 6 ANE kernel dispatches:
 
 For the 12-layer Stories110M model, this means **72 ANE kernels per compile** (60 weight-bearing + 12 weight-free sdpaBwd2).
 
-CPU handles: RMSNorm backward, residual connections, cross-entropy loss, classifier matmul, dW gradient accumulation (cblas_sgemm), Adam optimizer.
+**`train_large_ane.m`** extends this with 4 additional ANE kernel types (see [ANE-Offloaded Operations](#ane-offloaded-operations) below), bringing the total to **~86 kernels per compile**.
+
+CPU handles: dW gradient accumulation (cblas_sgemm, runs async in parallel with ANE), Adam optimizer (weights must be mutated — impossible on ANE), NLL loss gradient (requires target token indexing).
 
 ### System Stack
 
@@ -69,16 +71,19 @@ CPU handles: RMSNorm backward, residual connections, cross-entropy loss, classif
 
 ### `ane-training/` — ANE Runtime & Kernels (Obj-C)
 
-The low-level engine. Reverse-engineers private `AppleNeuralEngine.framework` APIs to compile and run MIL programs on ANE.
+The low-level engine. Reverse-engineers private `AppleNeuralEngine.framework` APIs to compile and run MIL programs on ANE. Modified after forking from [maderix/ane-training](https://github.com/maderix/ane-training).
 
-- **`training/train_large.m`** — Main training program: 12-layer Stories110M, full forward/backward, checkpoint, exec() restart
+- **`training/train_large.m`** — Baseline training: 12-layer Stories110M, forward/backward, checkpoint, exec() restart
+- **`training/train_large_ane.m`** — ANE-offloaded variant: moves classifier, softmax, RMSNorm backward to ANE
+- **`training/ane_rmsnorm_bwd.h`** — MIL generator for RMSNorm backward on ANE
+- **`training/ane_classifier.h`** — MIL generators for classifier, softmax, final RMSNorm on ANE
 - **`training/stories_*.h`** — Config, IO, MIL generators, CPU ops
 - **`inmem_*.m`, `sram_*.m`** — ANE benchmarks and hardware probes
 - **`bridge/`** — C-callable shared library for Python access
 
 ### `nanochat/` — LLM Training Harness (Python)
 
-A fork of [Andrej Karpathy's nanochat](https://github.com/karpathy/nanochat). Covers tokenization, pretraining, SFT, RLHF, evaluation, and a ChatGPT-like web UI. Extended here with:
+Modified after forking fork of [Andrej Karpathy's nanochat](https://github.com/karpathy/nanochat). Covers tokenization, pretraining, SFT, RLHF, evaluation, and a ChatGPT-like web UI. Extended here with:
 
 - **`scripts/ane_train.py`** — ANE training backend that routes linear layers through the ANE bridge
 - **`runs/runane.sh`** — Script to build the bridge and run ANE training
@@ -107,11 +112,27 @@ The code measures and prints performance metrics at runtime (ms/step, TFLOPS, AN
 
 > **Note:** These numbers come from the upstream `ane-training` project and have not been independently verified by us. Your results will vary by hardware (M1/M2/M3/M4/M5) and macOS version.
 
-### Key Optimizations (from `ane-training`)
+### ANE-Offloaded Operations
+
+`train_large_ane.m` moves additional operations from CPU to ANE, verified on M4/M5:
+
+| Operation | CPU Time | ANE Time | Speedup | Kernel Type |
+|---|---|---|---|---|
+| Classifier forward (embed @ x) | 10.77 ms | 1.06 ms | **10.2×** | 32000-channel conv |
+| Softmax over VOCAB=32000 | 81.11 ms | 2.40 ms | **33.8×** | MIL `softmax` op |
+| RMSNorm backward (per layer) | 0.18 ms | 0.21 ms | ~1× | element-wise + reduce |
+| Final RMSNorm | — | — | — | same as forward RMSNorm |
+
+**What stays on CPU (and why):**
+- **Adam optimizer** — impossible on ANE (weights are baked constants at compile time)
+- **dW gradient accumulation** — already runs in parallel with ANE via GCD async dispatch
+- **Classifier backward** — ANE rejects 32000-input-channel convs; matmul fallback is 2× slower than cblas
+- **NLL loss + gradient** — requires per-position target token indexing (`gather`)
+
+### Key Optimizations
 
 - **Channel-first CPU layout** — matches ANE IOSurface `[1,C,1,S]` format, eliminates transpose overhead
 - **NEON vectorized fp16↔fp32** — ARM NEON intrinsics for fast IOSurface data transfer
-- **vDSP cross-entropy** — `vvexpf` + `vDSP_sve` path, faster than scalar
 - **GCD async cblas overlap** — dW gradient sgemms run in parallel with ANE evals on a background dispatch queue
 - **Deferred cblas wait** — wait pushed into next step's forward pass for overlap
 - **Forward taps** — Q, K, V, attention scores exposed via concat outputs, avoiding CPU recompute
@@ -140,13 +161,16 @@ The `m5result.md` file documents actual hardware probing results from an **M5** 
 ### Option A: Pure Obj-C training (ane-training)
 
 ```bash
-cd ane-training
+cd ane-training/training
 
-# You need pretokenized data first
-cd training && python3 tokenize.py && cd ..
+# Pretokenize data first
+python3 tokenize.py
 
-# Build and run
-cd training && make train_large && ./train_large
+# Baseline training (classifier + softmax on CPU)
+make train_large && ./train_large
+
+# ANE-offloaded training (classifier + softmax on ANE — faster)
+make train_large_ane && ./train_large_ane
 ```
 
 ### Option B: Python-based training (nanochat + ANE bridge)
@@ -176,6 +200,8 @@ This will set up the virtual environment, build the ANE bridge, and train a tiny
 - [ ] Explore `_ANEPerformanceStats.hwExecutionTime` for accurate ANE timing
 - [ ] Real-time eval path (`evaluateRealTimeWithModel:`) for lower latency
 - [ ] Higher accumulation steps to amortize compile cost
+- [ ] Fuse residual `add` into forward kernels (eliminate CPU round-trip for skip connections)
+- [ ] Tile classifier backward for ANE (32000-input-ch conv fails, matmul is slow)
 - [ ] Integration with nanochat's SFT/RLHF stages on ANE
 - [ ] Compatibility testing across Apple Silicon generations (M1/M2/M3/M4/M5)
 - [ ] Document discovered MIL instructions and ANE behavior
@@ -225,4 +251,3 @@ The included components also carry MIT licenses:
 <p align="center">
   <i>Built with curiosity, reverse engineering, and a healthy disregard for "inference only."</i>
 </p>
-# ANEgpt
