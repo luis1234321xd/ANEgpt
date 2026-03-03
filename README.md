@@ -1,4 +1,4 @@
-<img src="ane-training/training/dashboard.gif" width="720" alt="ANE training dashboard">
+<!-- <img src="ane-training/training/dashboard.gif" width="720" alt="ANE training dashboard"> -->
 
 # ANEgpt
 
@@ -71,7 +71,7 @@ CPU handles: dW gradient accumulation (cblas_sgemm, runs async in parallel with 
 
 ### `ane-training/` — ANE Runtime & Kernels (Obj-C)
 
-The low-level engine. Reverse-engineers private `AppleNeuralEngine.framework` APIs to compile and run MIL programs on ANE. Modified after forking from [maderix/ane-training](https://github.com/maderix/ane-training).
+The low-level engine. Reverse-engineers private `AppleNeuralEngine.framework` APIs to compile and run MIL programs on ANE. Modified after forking from [maderix/ane-training](https://github.com/maderix/ANE).
 
 - **`training/train_large.m`** — Baseline training: 12-layer Stories110M, forward/backward, checkpoint, exec() restart
 - **`training/train_large_ane.m`** — ANE-offloaded variant: moves classifier, softmax, RMSNorm backward to ANE
@@ -129,6 +129,26 @@ The code measures and prints performance metrics at runtime (ms/step, TFLOPS, AN
 - **Classifier backward** — ANE rejects 32000-input-channel convs; matmul fallback is 2× slower than cblas
 - **NLL loss + gradient** — requires per-position target token indexing (`gather`)
 
+### `train_large` vs `train_large_ane`
+
+| Operation | `train_large` (baseline) | `train_large_ane` (offloaded) |
+|---|---|---|
+| 12-layer forward (fwdAttn, fwdFFN) | ANE | ANE |
+| 12-layer backward (ffnBwd, sdpaBwd, qkvBwd) | ANE | ANE |
+| Final RMSNorm forward | CPU (vDSP) | **ANE** kernel |
+| Classifier forward (`embed @ x`) | CPU (cblas) | **ANE** conv (10× faster) |
+| Softmax over vocab=32000 | CPU (vDSP) | **ANE** softmax op (34× faster) |
+| RMSNorm backward (per layer) | CPU (vDSP) | **ANE** kernel + CPU for dw |
+| Classifier backward (`embed^T @ dlogits`) | CPU (cblas) | CPU (cblas) |
+| dW gradient accumulation | CPU (async cblas) | CPU (async cblas) |
+| Adam optimizer | CPU | CPU |
+| NLL loss + gradient | CPU | CPU |
+
+| Metric | `train_large` | `train_large_ane` |
+|---|---|---|
+| Kernels per compile | 72 | 86 |
+| ms/step | ~106 | ~93 |
+
 ### Key Optimizations
 
 - **Channel-first CPU layout** — matches ANE IOSurface `[1,C,1,S]` format, eliminates transpose overhead
@@ -156,15 +176,38 @@ The `m5result.md` file documents actual hardware probing results from an **M5** 
 
 - **macOS 15+** on Apple Silicon (tested on M4, M5)
 - **Xcode Command Line Tools** (`xcode-select --install`)
-- **Python 3.10+** and [uv](https://docs.astral.sh/uv/) (for nanochat path only)
+- **Python 3.10+** (for data download and dashboard)
+- [uv](https://docs.astral.sh/uv/) (for nanochat path only)
 
-### Option A: Pure Obj-C training (ane-training)
+### Step 1: Download Training Data
+
+The training programs require pretokenized [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) data (flat uint16 token IDs, Llama 2 BPE, 32K vocab). Run the included download script:
 
 ```bash
 cd ane-training/training
+bash download_data.sh
+```
 
-# Pretokenize data first
-python3 tokenize.py
+This downloads `data00.bin` (~41 MB, ~20M tokens) from [enio/TinyStories](https://huggingface.co/datasets/enio/TinyStories) on HuggingFace and saves it as `tinystories_data00.bin`.
+
+> **Note:** The download fetches a ~993 MB tar.gz archive, extracts shard 0, then cleans up. Ensure you have enough temporary disk space.
+
+### Step 2: (Optional) Download Pretrained Weights
+
+Both training programs can start from pretrained [Stories110M](https://huggingface.co/karpathy/tinyllamas) weights (llama2.c format). Without them, training starts from random initialization.
+
+```bash
+mkdir -p assets/models    # from repo root
+curl -L -o assets/models/stories110M.bin \
+  https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.bin
+```
+
+### Step 3: Build & Train
+
+#### Option A: Pure Obj-C training (ane-training)
+
+```bash
+cd ane-training/training
 
 # Baseline training (classifier + softmax on CPU)
 make train_large && ./train_large
@@ -173,7 +216,25 @@ make train_large && ./train_large
 make train_large_ane && ./train_large_ane
 ```
 
-### Option B: Python-based training (nanochat + ANE bridge)
+**CLI flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--steps N` | 10000 | Total training steps |
+| `--lr F` | 3e-4 | Learning rate |
+| `--resume` | — | Resume from checkpoint |
+
+```bash
+# Quick 100-step test run
+./train_large --steps 100
+
+# Resume training from checkpoint
+./train_large --resume
+```
+
+The training loop automatically handles the ANE ~119 compile limit by saving a checkpoint and `exec()` restarting — this is transparent and the process resumes from where it left off.
+
+#### Option B: Python-based training (nanochat + ANE bridge)
 
 ```bash
 cd nanochat
@@ -181,6 +242,66 @@ bash runs/runane.sh
 ```
 
 This will set up the virtual environment, build the ANE bridge, and train a tiny model on synthetic data. See `runs/runane.sh` for details.
+
+### Step 4: Monitor with Dashboard
+
+The TUI dashboard shows real-time loss curves, power/CPU/memory graphs, and text generation:
+
+```bash
+# Install dashboard dependencies
+pip install blessed psutil numpy
+
+# Run alongside training (in a separate terminal)
+cd ane-training/training
+sudo python3 dashboard.py          # live mode (needs powermetrics via sudo)
+sudo python3 dashboard.py --resume  # attach to running/resumed training
+```
+
+### Step 5: Benchmarking
+
+Both training programs print an **Efficiency Report** at the end of training with per-step timing and ANE utilization:
+
+```
+=== Efficiency Report ===
+Total steps:     100
+Wall time:       45231 ms (45.2 s)
+Compile time:    8200 ms (18.1%)
+Train time:      37031 ms (81.9%)
+Avg train:       107.0 ms/step
+ANE TFLOPS:      2.45 sustained
+Total TFLOPS:    3.12 (ANE+CPU)
+ANE utilization: 15.5% of 15.8 TFLOPS
+```
+
+**Per-batch breakdown** is also printed during training:
+
+```
+  [batch 10: compile=7580ms train=1070ms (107.0ms/step) compiles=72]
+    ane=9.6 io=4.1 cls=9.1 elem=14.4 rms=0.1 cblas_wait=2.3 ms/step
+```
+
+| Metric | Description |
+|--------|-------------|
+| `ane` | ANE kernel evaluation time |
+| `io` | NEON fp16↔fp32 IOSurface data transfer |
+| `cls` | Classifier matmul (cblas) — only in `train_large` |
+| `elem` | Embedding lookup, residual adds, cross-entropy |
+| `rms` | RMSNorm forward/backward (CPU) |
+| `cblas_wait` | Time waiting for async dW gradient sgemms |
+| `ANE TFLOPS` | Sustained FLOPs on ANE / train time |
+| `ANE utilization` | Sustained TFLOPS / 15.8 (Apple's published M4 ANE peak) |
+
+To compare baseline vs ANE-offloaded performance:
+
+```bash
+# Baseline benchmark (100 steps)
+make train_large && ./train_large --steps 100
+
+# ANE-offloaded benchmark (100 steps)
+make train_large_ane && ./train_large_ane --steps 100
+```
+
+The key difference: `train_large_ane` moves classifier forward (10×), softmax (34×), and RMSNorm backward to ANE, reducing the `cls` and `elem` components significantly.
 
 ---
 

@@ -492,25 +492,12 @@ int main(int argc, char *argv[]) {
                                 dlogits, SEQ, x_final, SEQ, 1.0f, gembed, DIM);
                 });
 
-                // CHANGED: Final RMSNorm backward on ANE
-                // Write concat(dy, x_cur) to rmsnorm backward kernel
-                // But we also need dw on CPU — so we still compute dw on CPU
+                // Final RMSNorm backward (CPU — just one call, not worth ANE overhead)
                 {
-                    // First get dw on CPU (cheap — just dot products over seq)
-                    // We need the forward rrms to compute dw:
-                    // dw[i] += sum_t(dy[i,t] * x[i,t] * rrms[t])
-                    // For now, use CPU rmsnorm_bwd for dw only, ANE for dx
-                    float *dx_rms_ane = (float*)malloc(SEQ*DIM*4);
-                    
-                    // ANE: compute dx
-                    io_write_fp16_at(rmsAttBwd[0]->ioIn, 0, dy, DIM, SEQ);  // reuse any rmsbwd kernel
-                    io_write_fp16_at(rmsAttBwd[0]->ioIn, DIM, x_cur, DIM, SEQ);
-                    // Actually we need a kernel with rms_final baked — use finalRmsKern's approach
-                    // For now, fall back to CPU for final rmsnorm backward (it's just one call)
                     float *dx_rms_final = (float*)calloc(SEQ*DIM, 4);
                     rmsnorm_bwd(dx_rms_final, grms_final, dy, x_cur, rms_final, DIM, SEQ);
                     memcpy(dy, dx_rms_final, SEQ*DIM*4);
-                    free(dx_rms_final); free(dx_rms_ane);
+                    free(dx_rms_final);
                 }
                 t1=mach_absolute_time(); t_rms+=tb_ms(t1-t0);
 
@@ -553,11 +540,10 @@ int main(int argc, char *argv[]) {
                     // dw for rmsnorm_ffn still on CPU (accumulate per step)
                     {
                         float *dw_tmp = (float*)calloc(DIM, 4);
-                        rmsnorm_bwd(NULL, dw_tmp, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ);
-                        // Actually we only need dw, not dx — but rmsnorm_bwd computes both
-                        // Since we already have dx from ANE, just take dw
+                        float *dx_scratch = (float*)malloc(SEQ*DIM*4);
+                        rmsnorm_bwd(dx_scratch, dw_tmp, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ);
                         for(int i=0;i<DIM;i++) gr->rms_ffn[i] += dw_tmp[i];
-                        free(dw_tmp);
+                        free(dx_scratch); free(dw_tmp);
                     }
                     // Add residual: dx2 += dy
                     for(int i=0;i<SEQ*DIM;i++) dx2[i] += dy[i];
@@ -614,9 +600,10 @@ int main(int argc, char *argv[]) {
                     // dw for rmsnorm_att still on CPU
                     {
                         float *dw_tmp = (float*)calloc(DIM, 4);
-                        rmsnorm_bwd(NULL, dw_tmp, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ);
+                        float *dx_scratch = (float*)malloc(SEQ*DIM*4);
+                        rmsnorm_bwd(dx_scratch, dw_tmp, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ);
                         for(int i=0;i<DIM;i++) gr->rms_att[i] += dw_tmp[i];
-                        free(dw_tmp);
+                        free(dx_scratch); free(dw_tmp);
                     }
 
                     for(int i=0;i<SEQ*DIM;i++) dy[i] = dx_rms1[i] + dx2[i];
@@ -671,13 +658,24 @@ int main(int argc, char *argv[]) {
         double wall = tb_ms(mach_absolute_time() - t_wall_start);
         total_compile_ms += cum_compile; total_train_ms += cum_train;
         wall += cum_wall; total_steps_done += cum_steps; total_batches += cum_batches;
-        printf("\n=== Efficiency Report (ANE-offloaded) ===\n");
+
+        // FLOP accounting — same as train_large.m but classifier+softmax now on ANE
+        double fwd_flops = NLAYERS * (4.0*2*DIM*DIM*SEQ + 2.0*2*DIM*HIDDEN*SEQ + 2.0*HIDDEN*DIM*SEQ);
+        double sdpa_flops = NLAYERS * 2.0*HEADS*5*SEQ*SEQ*HD;
+        double cls_flops = 2.0*VOCAB*DIM*SEQ;
+        double total_flops = (fwd_flops*3 + sdpa_flops + cls_flops*3) * total_steps_done;
+        // In train_large_ane: classifier fwd + softmax run on ANE (not CPU)
+        double ane_flops = (fwd_flops*2 + sdpa_flops + cls_flops) * total_steps_done;
+
+        printf("\n=== Efficiency Report ===\n");
         printf("Total steps:     %d\n", total_steps_done);
         printf("Wall time:       %.0f ms (%.1f s)\n", wall, wall/1000);
         printf("Compile time:    %.0f ms (%.1f%%)\n", total_compile_ms, 100*total_compile_ms/wall);
         printf("Train time:      %.0f ms (%.1f%%)\n", total_train_ms, 100*total_train_ms/wall);
         printf("Avg train:       %.1f ms/step\n", total_train_ms/total_steps_done);
-
+        printf("ANE TFLOPS:      %.2f sustained\n", ane_flops / (total_train_ms * 1e9));
+        printf("Total TFLOPS:    %.2f (ANE+CPU)\n", total_flops / (total_train_ms * 1e9));
+        printf("ANE utilization: %.1f%% of 15.8 TFLOPS\n", 100*ane_flops/(total_train_ms*1e9)/15.8);
         // Cleanup
         for (int L=0; L<NLAYERS; L++) {
             free_layer_kernels(&kern[L]); free_kern(sdpaBwd2[L]);
